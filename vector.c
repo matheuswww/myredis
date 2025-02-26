@@ -27,7 +27,9 @@ void removeFirstElement(Vector* vector) {
     printf("Error: Vector is empty\n");
     return;
   }
-  memmove(vector->data, (char*)vector->data + vector->element_size, (vector->size) * vector->element_size);
+  memmove(vector->data, (char*)vector->data + vector->element_size, (vector->size - 1) * vector->element_size);
+  vector->size--;
+
   if (vector->size < vector->capacity / 4 && vector->capacity > 1) {
     resizeVector(vector, vector->capacity / 2);
   }
@@ -42,6 +44,10 @@ void removeLastElement(Vector* vector) {
   if (vector->size < vector->capacity / 4 && vector->capacity > 1) {
     resizeVector(vector, vector->capacity / 2);
   }
+}
+
+void clear(Vector* vector) {
+  vector->size = 0;
 }
 
 void freeVector(Vector* vector) {

@@ -16,6 +16,7 @@ void resizeVector(Vector* vector, size_t newCapacity);
 void insertElement(Vector* vector, void* element);
 void removeFirstElement(Vector* vector);
 void removeLastElement(Vector* vector);
+void clear(Vector* vector);
 void freeVector(Vector* vector);
 
 #endif
