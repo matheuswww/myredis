@@ -16,7 +16,7 @@
 #include "./vector.h"
 #include "./map.h"
 
-const size_t k_max_msg = 4096;
+const size_t k_max_msg = 32 << 20;
 
 typedef struct {
   int fd;
@@ -117,6 +117,7 @@ static bool try_one_request(Conn* conn) {
   memcpy(&len, conn->incoming->data, 4);
   if (len > k_max_msg) {
     conn->want_close = true;
+    printf("too long: %u\n", len);
     return false; // want close
   }
   // message body
