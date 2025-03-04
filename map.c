@@ -73,6 +73,26 @@ void* get(Map* map, void* key, int key_size) {
   return NULL;
 }
 
+void del(Map* map, void* key) {
+  int index = hash(key, sizeof(int), map->capacity);
+  Node* node = map->vector[index];
+  Node* prev = NULL;
+  while (node != NULL) {
+    if (memcmp(node->key, key, sizeof(int)) == 0) {
+      if (prev) {
+        prev->next = node->next;
+      } else {
+        map->vector[index] = node->next;
+      }
+      free(node);
+      map->size--;
+      break;
+    }
+    prev = node;
+    node = node->next;
+  }
+}
+
 void freeMap(Map* map) {
   if (map != NULL) {
     for (int i = 0; i < map->capacity; i++) {

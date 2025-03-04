@@ -9,6 +9,7 @@ typedef struct Node {
   void* key;
   void* value;
   int key_size;
+  int val_size;
   struct Node* next;
 } Node;
 
@@ -24,5 +25,6 @@ void put(Map* map, void* key, void* value, int key_size);
 void* get(Map* map, void* key, int key_size);
 void resizeMap(Map* map);
 void freeMap(Map* map);
+void del(Map* map, void* key);
 
 #endif // HASH_MAP_H

@@ -27,6 +27,18 @@ typedef struct {
   Vector* outgoing;
 } Conn;
 
+typedef struct {
+  uint32_t status;
+  Vector* data;
+} Response;
+
+// Response::status
+enum {
+  RES_OK = 0,
+  RES_ERR = 1, // error
+  RES_NX = 2, // key not found
+};
+
 static void msg(const char *msg) {
   fprintf(stderr, "%s\n", msg);
 }
@@ -107,6 +119,83 @@ Conn* handle_accept(int fd) {
   return conn;
 }
 
+static bool read_u32(const uint8_t **cur, const uint8_t *end, uint32_t *out) {
+  if ((*cur + 4) > end) {
+    return false;
+  }
+  memcpy(out, *cur, 4);
+  *cur += 4;
+  return true;
+}
+
+static bool read_str(const uint8_t **cur, const uint8_t *end, size_t n, char *out) {
+  if (*cur + n > end) {
+    return false;
+  }
+  memcpy(out, *cur, n);
+  out[n] = '\0';
+  *cur += n;
+  return true;
+}
+
+static int32_t parse_req(const uint8_t *data, size_t size, Vector* out) {
+  const uint8_t *end = data + size;
+  uint32_t nstr = 0;
+  if (!read_u32(&data, end, &nstr)) {
+    return -1;
+  }
+
+  if (nstr > k_max_msg) {
+    return -1;
+  }
+
+  while (out->size < nstr) {
+    uint32_t len = 0;
+    if (!read_u32(&data, end, &len)) {
+      return -1;
+    }
+    char *str = (char*)malloc(len + 1);
+    if (!read_str(&data, end, len, str)) {
+      free(str);
+      return -1;
+    }
+    insertElement(out, &str);
+  }
+  if (data != end) {
+    return -1; // trailing garbage
+  }
+  return 0;
+}
+
+Map* g_data;
+
+static void do_request(Vector* cmd, Response *out) {
+  if (cmd->size == 2 && strcmp(*((char**)cmd->data), "get") == 0) {
+    void* val = get(g_data, *(((char**)(cmd->data)) + 1), sizeof(char*));
+    if (val == NULL) {
+      out->status = RES_NX; // not found
+      return;
+    }
+    memcpy(*((char**)(cmd->data)), (char*)val, sizeof(char*));
+  } else if (cmd->size == 3 && strcmp(*((char**)cmd->data), "set") == 0) {
+    char* val = *(((char**)(cmd->data)) + 1);
+    char* aux = val;
+    memmove(val, *(((char**)(cmd->data)) + 2), sizeof(char*));
+    memmove(*(((char**)(cmd->data)) + 2), aux, sizeof(char*));
+  } else if (cmd->size == 2 && strcmp(*((char**)cmd->data), "del") == 0) {
+    del(g_data, *(((char**)(cmd->data)) + 1));
+  } else {
+    out->status = RES_ERR; // unrecognized command
+  }
+}
+
+static void make_response(const Response *resp, Vector* out) {
+  uint32_t resp_len = 4 + (uint32_t)resp->data->size;
+  buf_append(out, (const uint8_t *)&resp_len, 4);
+  buf_append(out, (const uint8_t *)&resp->status, 4);
+  buf_append(out, resp->data->data, resp->data->size);
+}
+
 // process 1 request if there is enough data
 static bool try_one_request(Conn* conn) {
     // try to parse the protocol: message header
@@ -125,12 +214,18 @@ static bool try_one_request(Conn* conn) {
     return false; // want read
   }
   const uint8_t* request = (const uint8_t*)conn->incoming->data + 4;
+    
   // got one request, do some application logic
-  printf("client says: len:%d data:%.*s\n",
-        len, len < 100 ? len : 100, (char*)request);
-  // generate the response (echo)
-  buf_append(conn->outgoing, (const uint8_t *)&len, 4);
-  buf_append(conn->outgoing, request, len);
+  Vector* cmd = createVector(sizeof(char*));
+  if (parse_req(request, len, cmd) < 0) {
+    conn->want_close = true;
+    return false; // error
+  }
+  Response* resp = malloc(sizeof(Response));
+  resp->status = 0;
+  resp->data = createVector(sizeof(uint8_t));
+  do_request(cmd, resp);
+  make_response(resp, conn->outgoing);
   // application logic done! remove the request message.
   buf_consume(conn->incoming, 4 + len);
   return true; // success
@@ -224,6 +319,8 @@ int main() {
   if (listen(fd, SOMAXCONN) < 0) {
       die("listen()");
   }
+
+  g_data = createMap();
 
   // a map of all client connections, keyed by fd
   Map *fd2conn = createMap();
