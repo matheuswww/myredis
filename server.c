@@ -15,6 +15,7 @@
 #include <netinet/ip.h>
 #include "./vector.h"
 #include "./map.h"
+#include "hashtable.h"
 
 const size_t k_max_msg = 32 << 20;
 
@@ -38,6 +39,10 @@ enum {
   RES_ERR = 1, // error
   RES_NX = 2, // key not found
 };
+
+
+#define container_of(ptr, T, member) \
+    ((T *)( (char *)ptr - offsetof(T, member) ))
 
 static void msg(const char *msg) {
   fprintf(stderr, "%s\n", msg);
@@ -167,23 +172,95 @@ static int32_t parse_req(const uint8_t *data, size_t size, Vector* out) {
   return 0;
 }
 
-Map* g_data;
+typedef struct {
+  HMap db; // top-level hashtable
+} s_g_data;
 
-static void do_request(Vector* cmd, Response *out) {
-  if (cmd->size == 2 && strcmp(*((char**)cmd->data), "get") == 0) {
-    void* val = get(g_data, *(((char**)(cmd->data)) + 1), sizeof(char*));
-    if (val == NULL) {
-      out->status = RES_NX; // not found
-      return;
-    }
-    memcpy(*((char**)(cmd->data)), (char*)val, sizeof(char*));
-  } else if (cmd->size == 3 && strcmp(*((char**)cmd->data), "set") == 0) {
-    char* val = *(((char**)(cmd->data)) + 1);
+s_g_data g_data;
+
+// KV pair for the top-level hashtable
+typedef struct Entry {
+  struct HNode node;
+  char *key;
+  char *val;
+} Entry;
+
+// equality comparison for `struct Entry`
+static bool entry_eq(HNode *lhs, HNode *rhs) {
+  struct Entry *le = container_of(lhs, struct Entry, node);
+  struct Entry *re = container_of(rhs, struct Entry, node);
+  int res = strcmp(le->key, re->key);
+  if (res != 0) {
+    return false;
+  }
+  return true;
+}
+
+// FNV hash
+static uint64_t str_hash(const uint8_t *data, size_t len) {
+  uint32_t h = 0x811C9DC5;
+  for (size_t i = 0; i < len; i++) {
+      h = (h + data[i]) * 0x01000193;
+  }
+  return h;
+}
+
+static void do_get(Vector* cmd, Response* out) {
+  // a dummy `Entry` just for the lookup
+  Entry key;
+  key.key = *(((char**)(cmd->data)) + 1);
+  key.node.hcode = str_hash((uint8_t *)key.key, strlen(key.key));
+  // hashtable lookup
+  HNode *node = hm_lookup(&g_data.db, &key.node, entry_eq);
+  if (node == NULL) {
+    printf("not found\n");
+    out->status = RES_NX; // not found
+    return;
+  }
+  // copy the value
+  char* val = container_of(node, struct Entry, node)->val;
+  assert(strlen(val) <= k_max_msg);
+  memcpy(*((char**)(cmd->data)), val, strlen(val) + 1);
+}
+
+static void do_set(Vector* cmd, Response* out) {
+  Entry key;
+  key.key = *(((char**)(cmd->data)) + 1);
+  key.node.hcode = str_hash((uint8_t *)key.key, strlen(key.key));
+  HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+  if (node) {
+    // found, update the value
+    char* val = container_of(node, Entry, node)->val;
     char* aux = val;
     memmove(val, *(((char**)(cmd->data)) + 2), sizeof(char*));
     memmove(*(((char**)(cmd->data)) + 2), aux, sizeof(char*));
+  } else {
+    // not found, allocate & insert a new pair
+    Entry *ent = malloc(sizeof(Entry));
+    ent->key = key.key;
+    ent->node.hcode = key.node.hcode;
+    ent->val = *(((char**)(cmd->data)) + 2);
+    hm_insert(&g_data.db, &ent->node);
+  }
+}
+
+static void do_del(Vector* cmd, Response* out) {
+  Entry key;
+  key.key = *(((char**)(cmd->data)) + 1);
+  key.node.hcode = str_hash((uint8_t *)key.key, strlen(key.key));
+  HNode *node = hm_delete(&g_data.db, &key.node, &entry_eq);
+  if (node) { // deallocate the pair
+    free(container_of(node, Entry, node));
+  }
+}
+
+static void do_request(Vector* cmd, Response *out) {
+  if (cmd->size == 2 && strcmp(*((char**)cmd->data), "get") == 0) {
+    do_get(cmd, out);
+  } else if (cmd->size == 3 && strcmp(*((char**)cmd->data), "set") == 0) {
+    do_set(cmd, out);
   } else if (cmd->size == 2 && strcmp(*((char**)cmd->data), "del") == 0) {
-    del(g_data, *(((char**)(cmd->data)) + 1));
+    do_del(cmd, out);
   } else {
     out->status = RES_ERR; // unrecognized command
   }
@@ -319,8 +396,6 @@ int main() {
   if (listen(fd, SOMAXCONN) < 0) {
       die("listen()");
   }
-
-  g_data = createMap();
 
   // a map of all client connections, keyed by fd
   Map *fd2conn = createMap();
