@@ -103,3 +103,24 @@ HNode *hm_lookup(HMap *hmap, HNode *key, bool(*eq)(HNode *, HNode *)) {
   }
   return NULL;
 }
+
+size_t hm_size(HMap *hmap) {
+  return hmap->newer.size + hmap->older.size;
+}
+
+static bool h_foreach(HTab *htab, bool(*f)(HNode *, void *), void *arg) {
+  for (size_t i = 0; htab->mask != 0 && i <= htab->mask; i++) {
+    HNode *cur = htab->tab[i];
+    while (cur) {
+      if (!f(cur, arg)) {
+        return false;
+      }
+      cur = cur->next;
+    }
+  }
+  return true;
+}
+
+void hm_foreach(HMap *hmap, bool(*f)(HNode *, void *), void *arg) {
+  h_foreach(&hmap->newer, f, arg) && h_foreach(&hmap->older, f, arg);
+}

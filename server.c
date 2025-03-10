@@ -19,6 +19,8 @@
 
 const size_t k_max_msg = 32 << 20;
 
+typedef Vector Buffer;
+
 typedef struct {
   int fd;
   bool want_read;
@@ -27,11 +29,6 @@ typedef struct {
   Vector* incoming;
   Vector* outgoing;
 } Conn;
-
-typedef struct {
-  uint32_t status;
-  Vector* data;
-} Response;
 
 // Response::status
 enum {
@@ -84,21 +81,6 @@ void newConn(Conn* conn) {
   conn->want_close = false;
   conn->want_read = false;
   conn->want_write = false;
-}
-
-// append to the back
-static void buf_append(Vector* buf, const uint8_t *data, size_t len) {
-  for (size_t i = 0; i < len; ++i) {
-    uint8_t element = data[i];
-    insertElement(buf, &element);
-  }
-}
-
-// remove from the front
-static void buf_consume(Vector* buf, size_t n) {
-  for (size_t i = 0; i < n; ++i) {
-    removeFirstElement(buf);
-  }
 }
 
 // application callback when the listening socket is ready
@@ -172,6 +154,82 @@ static int32_t parse_req(const uint8_t *data, size_t size, Vector* out) {
   return 0;
 }
 
+// error code for TAG_ERR
+enum {
+  ERR_UNKNOWN = 1,    // unknown command
+  ERR_TOO_BIG = 2,    // response too big
+};
+
+// data types of serialized data
+enum {
+  TAG_NIL = 0,    // nil
+  TAG_ERR = 1,    // error code + msg
+  TAG_STR = 2,    // string
+  TAG_INT = 3,    // int64
+  TAG_DBL = 4,    // double
+  TAG_ARR = 5,    // array
+};
+
+// append to the back
+static void buf_append(Vector* buf, const uint8_t *data, size_t len) {
+  for (size_t i = 0; i < len; ++i) {
+    uint8_t element = data[i];
+    insertElement(buf, &element);
+  }
+}
+
+// remove from the front
+static void buf_consume(Vector* buf, size_t n) {
+  for (size_t i = 0; i < n; ++i) {
+    removeFirstElement(buf);
+  }
+}
+
+// help functions for the serialization
+static void buf_append_u8(Buffer *buf, uint8_t data) {
+  insertElement(buf, &data);
+}
+
+static void buf_append_u32(Buffer *buf, uint32_t data) {
+  buf_append(buf, (uint8_t*)&data, 4);
+}
+
+static void buf_append_i64(Buffer *buf, int64_t data) {
+  buf_append(buf, (uint8_t*)&data, 8);
+}
+
+static void buf_append_dbl(Buffer *buf, double data) {
+  buf_append(buf, (uint8_t*)&data, 8);
+}
+
+// append serialized data types to the back
+static void out_nil(Buffer *out) {
+  buf_append_u8(out, TAG_NIL);
+}
+
+static void out_str(Buffer *out, const char *s, size_t size) {
+  buf_append_u8(out, TAG_STR);
+  buf_append_u32(out, (uint32_t)size);
+  buf_append(out, (const uint8_t *)s, size);
+}
+
+static void out_int(Buffer *out, int64_t n) {
+  buf_append_u8(out, TAG_INT);
+  buf_append_i64(out, n);
+}
+
+static void out_err(Buffer *out, uint32_t code, const char *msg) {
+  buf_append_u8(out, TAG_ERR);
+  buf_append_u32(out, code);
+  buf_append_u32(out, (uint32_t)strlen(msg));
+  buf_append(out, (const uint8_t *)msg, strlen(msg));
+}
+
+static void out_arr(Buffer *out, uint32_t n) {
+  buf_append_u8(out, TAG_ARR);
+  buf_append_u32(out, n);
+}
+
 typedef struct {
   HMap db; // top-level hashtable
 } s_g_data;
@@ -205,7 +263,7 @@ static uint64_t str_hash(const uint8_t *data, size_t len) {
   return h;
 }
 
-static void do_get(Vector* cmd, Response* out) {
+static void do_get(Vector* cmd, Buffer* out) {
   // a dummy `Entry` just for the lookup
   Entry key;
   key.key = *(((char**)(cmd->data)) + 1);
@@ -213,20 +271,21 @@ static void do_get(Vector* cmd, Response* out) {
   // hashtable lookup
   HNode *node = hm_lookup(&g_data.db, &key.node, entry_eq);
   if (node == NULL) {
-    printf("not found\n");
-    out->status = RES_NX; // not found
-    return;
+    return out_nil(out);
   }
   // copy the value
   char* val = container_of(node, struct Entry, node)->val;
   assert(strlen(val) <= k_max_msg);
   memcpy(*((char**)(cmd->data)), val, strlen(val) + 1);
+  return out_str(out, val, strlen(val));
 }
 
-static void do_set(Vector* cmd, Response* out) {
+static void do_set(Vector* cmd, Buffer* out) {
+  // a dummy `Entry` just for the lookup
   Entry key;
   key.key = *(((char**)(cmd->data)) + 1);
   key.node.hcode = str_hash((uint8_t *)key.key, strlen(key.key));
+// hashtable lookup
   HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
   if (node) {
     // found, update the value
@@ -242,9 +301,10 @@ static void do_set(Vector* cmd, Response* out) {
     ent->val = *(((char**)(cmd->data)) + 2);
     hm_insert(&g_data.db, &ent->node);
   }
+  return out_nil(out);
 }
 
-static void do_del(Vector* cmd, Response* out) {
+static void do_del(Vector* cmd, Buffer* out) {
   Entry key;
   key.key = *(((char**)(cmd->data)) + 1);
   key.node.hcode = str_hash((uint8_t *)key.key, strlen(key.key));
@@ -252,25 +312,52 @@ static void do_del(Vector* cmd, Response* out) {
   if (node) { // deallocate the pair
     free(container_of(node, Entry, node));
   }
+  return out_int(out, node ? 1 : 0);
 }
 
-static void do_request(Vector* cmd, Response *out) {
+static bool cb_keys(HNode *node, void *arg) {
+  Buffer* out = (Buffer *)arg;
+  char *key = container_of(node, Entry, node)->key;
+  out_str(out, key, strlen(key));
+  return true;
+}
+
+static void do_keys(Vector* cmd, Buffer* out) {
+  out_arr(out, (uint32_t)hm_size(&g_data.db));
+  hm_foreach(&g_data.db, &cb_keys, (void *)out);
+}
+
+static void do_request(Vector* cmd, Buffer *out) {
   if (cmd->size == 2 && strcmp(*((char**)cmd->data), "get") == 0) {
     do_get(cmd, out);
   } else if (cmd->size == 3 && strcmp(*((char**)cmd->data), "set") == 0) {
     do_set(cmd, out);
   } else if (cmd->size == 2 && strcmp(*((char**)cmd->data), "del") == 0) {
     do_del(cmd, out);
+  } else if (cmd->size == 1 && strcmp(*((char**)cmd->data), "keys") == 0) {
+    return do_keys(cmd, out);
   } else {
-    out->status = RES_ERR; // unrecognized command
+    return out_err(out, ERR_UNKNOWN, "unknown command.");
   }
 }
 
-static void make_response(const Response *resp, Vector* out) {
-  uint32_t resp_len = 4 + (uint32_t)resp->data->size;
-  buf_append(out, (const uint8_t *)&resp_len, 4);
-  buf_append(out, (const uint8_t *)&resp->status, 4);
-  buf_append(out, resp->data->data, resp->data->size);
+static void response_begin(Buffer *out, size_t *header) {
+  *header = out->size; // messege header position
+  buf_append_u32(out, 0); // reserve space
+}
+
+static size_t response_size(Buffer *out, size_t header) {
+  return out->size - header - 4;
+}
+
+static void response_end(Buffer *out, size_t header) {
+  size_t msg_size = response_size(out, header);
+  if (msg_size > k_max_msg) {
+    out_err(out, ERR_TOO_BIG, "response too big");
+    msg_size = response_size(out, header);
+  }
+  uint32_t len = (uint32_t)msg_size;
+  memcpy(((uint8_t *)out->data) + header, &len, 4);
 }
 
 // process 1 request if there is enough data
@@ -298,11 +385,11 @@ static bool try_one_request(Conn* conn) {
     conn->want_close = true;
     return false; // error
   }
-  Response* resp = malloc(sizeof(Response));
-  resp->status = 0;
-  resp->data = createVector(sizeof(uint8_t));
-  do_request(cmd, resp);
-  make_response(resp, conn->outgoing);
+  size_t header_pos = 0;
+  response_begin(conn->outgoing, &header_pos);
+  do_request(cmd, conn->outgoing);
+  response_end(conn->outgoing, header_pos);
+
   // application logic done! remove the request message.
   buf_consume(conn->incoming, 4 + len);
   return true; // success
