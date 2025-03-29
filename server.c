@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <errno.h>
 #include <stdbool.h>
+#include <math.h>
 // system
 #include <fcntl.h>
 #include <poll.h>
@@ -15,7 +16,8 @@
 #include <netinet/ip.h>
 #include "./vector.h"
 #include "./map.h"
-#include "hashtable.h"
+#include "zset.h"
+#include "./common.h"
 
 const size_t k_max_msg = 32 << 20;
 
@@ -37,9 +39,6 @@ enum {
   RES_NX = 2, // key not found
 };
 
-
-#define container_of(ptr, T, member) \
-    ((T *)( (char *)ptr - offsetof(T, member) ))
 
 static void msg(const char *msg) {
   fprintf(stderr, "%s\n", msg);
@@ -158,6 +157,8 @@ static int32_t parse_req(const uint8_t *data, size_t size, Vector* out) {
 enum {
   ERR_UNKNOWN = 1,    // unknown command
   ERR_TOO_BIG = 2,    // response too big
+  ERR_BAD_TYP = 3,    // unexpected value type
+  ERR_BAD_ARG = 4,    // bad arguments
 };
 
 // data types of serialized data
@@ -218,6 +219,11 @@ static void out_int(Buffer *out, int64_t n) {
   buf_append_i64(out, n);
 }
 
+static void out_dbl(Buffer *out, double val) {
+  buf_append_u8(out, TAG_DBL);
+  buf_append_dbl(out, val);
+}
+
 static void out_err(Buffer *out, uint32_t code, const char *msg) {
   buf_append_u8(out, TAG_ERR);
   buf_append_u32(out, code);
@@ -230,37 +236,67 @@ static void out_arr(Buffer *out, uint32_t n) {
   buf_append_u32(out, n);
 }
 
+static size_t out_begin_arr(Buffer *out) {
+  uint8_t tag_arr = TAG_ARR;
+  insertElement(out, &tag_arr);
+  buf_append_u32(out, 0); // filled by out_end_arr()
+  return out->size - 4;
+}
+
+static void out_end_arr(Buffer *out, size_t ctx, uint32_t n) {
+  assert(((uint8_t*)out->data)[ctx - 1] == TAG_ARR);
+  memcpy(&((uint8_t*)out->data)[ctx], &n, 4);
+}
+
 typedef struct {
   HMap db; // top-level hashtable
 } s_g_data;
 
 s_g_data g_data;
 
+// value types
+enum {
+  T_INIT = 0,
+  T_STR = 1, // string
+  T_ZSET = 2, // sorted set
+};
+
 // KV pair for the top-level hashtable
 typedef struct Entry {
   struct HNode node;
+  uint32_t type;
   char *key;
   char *val;
+  ZSet zset;
 } Entry;
 
-// equality comparison for `struct Entry`
-static bool entry_eq(HNode *lhs, HNode *rhs) {
-  struct Entry *le = container_of(lhs, struct Entry, node);
-  struct Entry *re = container_of(rhs, struct Entry, node);
-  int res = strcmp(le->key, re->key);
+static Entry *entry_new(uint32_t type) {
+  Entry *ent = malloc(sizeof(Entry));
+  ent->type = type;
+  return ent;
+}
+
+static void entry_del(Entry *ent) {
+  if (ent->type == T_ZSET) {
+    zset_clear(&ent->zset);
+  }
+  free(ent);
+}
+
+typedef struct LookupKey {
+  struct HNode node; // hashtable node
+  char* key;
+} LookupKey;
+
+// equality comparison for the top-level hashstable
+static bool entry_eq(HNode *node, HNode *key) {
+  struct Entry *ent = container_of(node, struct Entry, node);
+  struct LookupKey *keydata = container_of(key, struct LookupKey, node);
+  int res = strcmp(ent->key, keydata->key);
   if (res != 0) {
     return false;
   }
   return true;
-}
-
-// FNV hash
-static uint64_t str_hash(const uint8_t *data, size_t len) {
-  uint32_t h = 0x811C9DC5;
-  for (size_t i = 0; i < len; i++) {
-      h = (h + data[i]) * 0x01000193;
-  }
-  return h;
 }
 
 static void do_get(Vector* cmd, Buffer* out) {
@@ -327,6 +363,126 @@ static void do_keys(Vector* cmd, Buffer* out) {
   hm_foreach(&g_data.db, &cb_keys, (void *)out);
 }
 
+static bool str2dbl(const char* s, double *out) {
+  char *endp = NULL;
+  *out = strtod(s, &endp);
+  return endp == s + strlen(s) && !isnan(*out);
+}
+
+static bool str2int(const char* s, int64_t *out) {
+  char *endp = NULL;
+  *out = strtoll(s, &endp, 10);
+  return endp == s + strlen(s);
+}
+
+// zadd zset score name
+static void do_zadd(Vector* cmd, Buffer *out) {
+  double score = 0;
+  if (!str2dbl(*((char**)cmd->data + 2), &score)) {
+    return out_err(out, ERR_UNKNOWN, "expect fload");
+  }
+  // look up or create the zset
+  LookupKey key;
+  key.key = *((char**)cmd->data + 1);
+  key.node.hcode = str_hash((uint8_t *)key.key, strlen(key.key));
+  HNode *hnode = hm_lookup(&g_data.db, &key.node, &entry_eq);
+  Entry *ent = NULL;
+  if (!hnode) { // insert a new key
+    ent = entry_new(T_ZSET);
+    ent->key = *((char**)cmd->data + 1);
+    ent->node.hcode = key.node.hcode;
+    hm_insert(&g_data.db, &ent->node);
+  } else { // check the existing key
+    ent = container_of(hnode, Entry, node);
+    if (ent->type != T_ZSET) {
+      return out_err(out, ERR_UNKNOWN, "expect zset");
+    }
+  }
+  
+  const char *name = *((char**)cmd->data + 3);
+  bool added = zset_insert(&ent->zset, name, strlen(name), score);
+  return out_int(out, (int64_t)added);
+}
+
+static const ZSet k_empty_zset;
+
+static ZSet *expect_zset(char *s) {
+  LookupKey key;
+  key.key = s;
+  key.node.hcode = str_hash((uint8_t *)key.key, strlen(key.key));
+  HNode *hnode = hm_lookup(&g_data.db, &key.node, &entry_eq);
+  if (!hnode) { // a non-existent key is treated as an empty zset
+    return (ZSet *)&k_empty_zset;
+  }
+  Entry *ent = container_of(hnode, Entry, node);
+  return ent->type == T_ZSET ? &ent->zset : NULL;
+}
+
+// zrem zset name
+static void do_zrem(Vector *cmd, Buffer *out) {
+  ZSet *zset = expect_zset(*((char**)cmd->data + 1));
+  if (!zset) {
+    return out_err(out, ERR_BAD_TYP, "expect zset");
+  }
+
+  const char *name = *((char**)cmd->data + 2);
+  ZNode *znode = zset_lookup(zset, name, strlen(name));
+  if (znode) {
+    zset_delete(zset, znode);
+  }
+  return out_int(out, znode ? 1 : 0);
+}
+
+// zscore zset name
+static void do_zscore(Vector *cmd, Buffer *out) {
+  ZSet *zset = expect_zset(*((char**)cmd->data + 1));
+  if (!zset) {
+    return out_err(out, ERR_BAD_TYP, "expect zset");
+  }
+
+  const char *name = *((char**)cmd->data + 2);
+  ZNode *znode = zset_lookup(zset, name, strlen(name));
+  return znode ? out_dbl(out, znode->score) : out_nil(out);
+}
+
+// zquery zset score name offset limit
+static void do_zquery(Vector *cmd, Buffer *out) {
+  // parse args
+  double score = 0;
+  if (!str2dbl(*((char**)cmd->data + 2), &score)) {
+    return out_err(out, ERR_BAD_ARG, "expect fp number");
+  }
+  const char *name = *((char**)cmd->data + 3);
+  int64_t offset = 0, limit = 0;
+  if (!str2int(*((char**)cmd->data + 4), &offset) || !str2int(*((char**)cmd->data + 5), &limit)) {
+    return out_err(out, ERR_BAD_ARG, "expect int number");
+  }
+
+  // get the zset
+  ZSet *zset = expect_zset(*((char**)cmd->data + 1));
+  if (!zset) {
+    return out_err(out, ERR_BAD_TYP, "expect zset");
+  }
+
+  // seek to the key
+  if (limit <= 0) {
+    return out_arr(out, 0);
+  }
+  ZNode *znode = zset_seekge(zset, score, name, strlen(name));
+  znode = znode_offset(znode, offset);
+  
+  // output
+  size_t ctx = out_begin_arr(out);
+  int64_t n = 0;
+  while (znode && n < limit) {
+    out_str(out, znode->name, znode->len);
+    out_dbl(out, znode->score);
+    znode = znode_offset(znode, +1);
+    n += 2;
+  }
+  out_end_arr(out, ctx, (uint32_t)n);
+}
+
 static void do_request(Vector* cmd, Buffer *out) {
   if (cmd->size == 2 && strcmp(*((char**)cmd->data), "get") == 0) {
     do_get(cmd, out);
@@ -335,9 +491,17 @@ static void do_request(Vector* cmd, Buffer *out) {
   } else if (cmd->size == 2 && strcmp(*((char**)cmd->data), "del") == 0) {
     do_del(cmd, out);
   } else if (cmd->size == 1 && strcmp(*((char**)cmd->data), "keys") == 0) {
-    return do_keys(cmd, out);
+    do_keys(cmd, out);
+  } else if (cmd->size == 4 && strcmp(*((char**)cmd->data), "zadd") == 0) {
+    do_zadd(cmd, out);
+  } else if (cmd->size == 3 && strcmp(*((char**)cmd->data), "zrem") == 0) {
+    do_zrem(cmd, out);
+  } else if (cmd->size == 3 && strcmp(*((char**)cmd->data), "zscore") == 0) {
+    do_zscore(cmd, out);
+  } else if (cmd->size == 6 && strcmp(*((char**)cmd->data), "zquery") == 0) {
+    do_zquery(cmd, out);
   } else {
-    return out_err(out, ERR_UNKNOWN, "unknown command.");
+    out_err(out, ERR_UNKNOWN, "unknown command.");
   }
 }
 

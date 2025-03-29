@@ -2,6 +2,7 @@
 #include <stdbool.h>
 #include <assert.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 static void h_init(HTab *htab, size_t n) {
   assert(n > 0 && (n & (n - 1)) == 0);  // n must be a power of 2
@@ -102,6 +103,14 @@ HNode *hm_lookup(HMap *hmap, HNode *key, bool(*eq)(HNode *, HNode *)) {
     return *from;
   }
   return NULL;
+}
+
+void hm_clear(HMap *hmap) {
+  free(hmap->newer.tab);
+  free(hmap->older.tab);
+  hmap->newer = (HTab){ NULL, 0, 0 };
+  hmap->older = (HTab){ NULL, 0, 0 };
+  hmap->migrate_pos = 0;
 }
 
 size_t hm_size(HMap *hmap) {
