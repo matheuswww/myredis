@@ -223,7 +223,7 @@ int main(int argc, char **argv) {
 
   Vector* cmd = createVector(sizeof(char*));
   for (int i = 1; i < argc; ++i) {
-    insertElement(cmd, &argv[i]);
+    insertElement(cmd, &argv[i], -1);
   }
   int32_t err = send_req(fd, cmd);
   if (err) {

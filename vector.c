@@ -19,11 +19,14 @@ void insertElement(Vector* vector, void* element, int pos) {
   if (vector->size == vector->capacity) {
     resizeVector(vector, vector->capacity * 2);
   }
+  int arg = pos;
   if (pos < 0) {
     pos = vector->size;
   }
   memcpy((char*)vector->data + pos * vector->element_size, element, vector->element_size);
-  vector->size++;
+  if ((arg != vector->size && arg > 0) || arg < 0) {
+    vector->size++;
+  }
 }
 
 void removeFirstElement(Vector* vector) {
