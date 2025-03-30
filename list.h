@@ -1,26 +1,26 @@
 #include <stddef.h>
 
-struct DList {
-  DList *prev = NULL;
-  DList *next = NULL;
-};
+typedef struct DList {
+  struct DList *prev;
+  struct DList *next;
+} DList;
 
-inline void dlist_init(DList *node) {
+static inline void dlist_init(DList *node) {
   node->prev = node->next = node;
 }
 
-inline bool dlist_empty(DList *node) {
+static inline bool dlist_empty(DList *node) {
   return node->next == node;
 }
 
-inline void dlist_detach(DList *node) {
+static inline void dlist_detach(DList *node) {
   DList *prev = node->prev;
   DList *next = node->next;
   prev->next = next;
   next->prev = prev;
 }
 
-inline void dlist_insert_before(DList *target, DList *rookie) {
+static inline void dlist_insert_before(DList *target, DList *rookie) {
   DList *prev = target->prev;
   prev->next = rookie;
   rookie->prev = prev;

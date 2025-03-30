@@ -13,10 +13,10 @@ typedef struct {
 
 Vector* createVector(size_t element_size);
 void resizeVector(Vector* vector, size_t newCapacity);
-void insertElement(Vector* vector, void* element);
+void insertElement(Vector* vector, void* element, int pos);
 void removeFirstElement(Vector* vector);
 void removeLastElement(Vector* vector);
 void clear(Vector* vector);
 void freeVector(Vector* vector);
-
+void resizeVector(Vector* vector, size_t newCapacity);
 #endif

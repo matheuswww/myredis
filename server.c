@@ -1,3 +1,5 @@
+#define _POSIX_C_SOURCE 200112L // Enable POSIX features
+
 // stdlib
 #include <assert.h>
 #include <stdint.h>
@@ -7,6 +9,7 @@
 #include <errno.h>
 #include <stdbool.h>
 #include <math.h>
+#include <time.h>
 // system
 #include <fcntl.h>
 #include <poll.h>
@@ -18,6 +21,7 @@
 #include "./map.h"
 #include "zset.h"
 #include "./common.h"
+#include "./list.h"
 
 const size_t k_max_msg = 32 << 20;
 
@@ -30,6 +34,8 @@ typedef struct {
   bool want_close;
   Vector* incoming;
   Vector* outgoing;
+  uint64_t last_active_ms;
+  DList idle_node;
 } Conn;
 
 // Response::status
@@ -39,6 +45,15 @@ enum {
   RES_NX = 2, // key not found
 };
 
+typedef struct {
+  HMap db; // top-level hashtable
+  // a map of all client connections, keyed by fd
+  Vector *fd2conn;
+  // timers for idle connections
+  DList idle_list;
+} s_g_data;
+
+s_g_data g_data;
 
 static void msg(const char *msg) {
   fprintf(stderr, "%s\n", msg);
@@ -52,6 +67,13 @@ static void die(const char *msg) {
   int err = errno;
   fprintf(stderr, "[%d] %s\n", err, msg);
   abort();
+}
+
+static uint64_t get_monotonic_msec() {
+  struct timespec tv = {0, 0};
+  clock_gettime(CLOCK_MONOTONIC, &tv);
+  u_int64_t a = (uint64_t)(tv.tv_sec) * 1000 + tv.tv_nsec / 1000 / 1000;
+  return a;
 }
 
 static void fd_set_nb(int fd) {
@@ -78,8 +100,9 @@ void newConn(Conn* conn) {
   conn->incoming = incomingVector;
   conn->outgoing = outcomingVector;
   conn->want_close = false;
-  conn->want_read = false;
   conn->want_write = false;
+  conn->want_read = true;
+  conn->last_active_ms = get_monotonic_msec();
 }
 
 // application callback when the listening socket is ready
@@ -101,8 +124,15 @@ Conn* handle_accept(int fd) {
   // create a struct Conn
   newConn(conn);
   conn->fd = connfd;
-  conn->want_read = true;
-  return conn;
+  dlist_insert_before(&g_data.idle_list, &conn->idle_node);
+  
+  // put it into the map
+  if (g_data.fd2conn->capacity <= (size_t)conn->fd) {
+    resizeVector(g_data.fd2conn, conn->fd + 1);
+  }
+  assert(!((Conn**)(g_data.fd2conn->data))[conn->fd]);
+  insertElement(g_data.fd2conn, &conn, conn->fd);
+  return 0;
 }
 
 static bool read_u32(const uint8_t **cur, const uint8_t *end, uint32_t *out) {
@@ -145,7 +175,7 @@ static int32_t parse_req(const uint8_t *data, size_t size, Vector* out) {
       free(str);
       return -1;
     }
-    insertElement(out, &str);
+    insertElement(out, &str, -1);
   }
   if (data != end) {
     return -1; // trailing garbage
@@ -175,7 +205,7 @@ enum {
 static void buf_append(Vector* buf, const uint8_t *data, size_t len) {
   for (size_t i = 0; i < len; ++i) {
     uint8_t element = data[i];
-    insertElement(buf, &element);
+    insertElement(buf, &element, -1);
   }
 }
 
@@ -188,7 +218,7 @@ static void buf_consume(Vector* buf, size_t n) {
 
 // help functions for the serialization
 static void buf_append_u8(Buffer *buf, uint8_t data) {
-  insertElement(buf, &data);
+  insertElement(buf, &data, -1);
 }
 
 static void buf_append_u32(Buffer *buf, uint32_t data) {
@@ -238,7 +268,7 @@ static void out_arr(Buffer *out, uint32_t n) {
 
 static size_t out_begin_arr(Buffer *out) {
   uint8_t tag_arr = TAG_ARR;
-  insertElement(out, &tag_arr);
+  insertElement(out, &tag_arr, -1);
   buf_append_u32(out, 0); // filled by out_end_arr()
   return out->size - 4;
 }
@@ -247,12 +277,6 @@ static void out_end_arr(Buffer *out, size_t ctx, uint32_t n) {
   assert(((uint8_t*)out->data)[ctx - 1] == TAG_ARR);
   memcpy(&((uint8_t*)out->data)[ctx], &n, 4);
 }
-
-typedef struct {
-  HMap db; // top-level hashtable
-} s_g_data;
-
-s_g_data g_data;
 
 // value types
 enum {
@@ -269,6 +293,15 @@ typedef struct Entry {
   char *val;
   ZSet zset;
 } Entry;
+
+static void conn_destroy(Conn *conn) {
+  close(conn->fd);
+  ((Conn**)g_data.fd2conn->data)[conn->fd] = NULL;
+  dlist_detach(&conn->idle_node);
+  freeVector(conn->incoming);
+  freeVector(conn->outgoing);
+  free(conn);
+}
 
 static Entry *entry_new(uint32_t type) {
   Entry *ent = malloc(sizeof(Entry));
@@ -621,12 +654,44 @@ static void handle_read(Conn *conn) {
   } // else: want read
 }
 
+const uint64_t k_idle_timeout_ms = 5 * 1000;
+
+static int32_t next_timer_ms() {
+  if (dlist_empty(&g_data.idle_list)) {
+    return -1;
+  }
+
+  uint64_t now_ms = get_monotonic_msec();
+  Conn *conn = container_of(g_data.idle_list.next, Conn, idle_node);
+  uint64_t next_ms = conn->last_active_ms + k_idle_timeout_ms;
+  if (next_ms <= now_ms) {
+    return 0;
+  }
+  return (int32_t)(next_ms - now_ms);
+}
+
+static void process_timers() {
+  uint64_t now_ms = get_monotonic_msec();
+  while (!dlist_empty(&g_data.idle_list)) {
+    Conn *conn = container_of(g_data.idle_list.next, Conn, idle_node);
+    uint64_t next_ms = conn->last_active_ms + k_idle_timeout_ms;
+    if (next_ms > now_ms) {
+      break; // not expired
+    }
+    fprintf(stderr, "removing idle connection: %d\n", conn->fd);
+    conn_destroy(conn);
+  }
+}
+
 
 int main() {
+  // initialization
+  dlist_init(&g_data.idle_list);
   // Create listening socket
   int fd = socket(AF_INET, SOCK_STREAM, 0);
+
   if (fd < 0) {
-      die("socket()");
+    die("socket()");
   }
   int val = 1;
   setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val));
@@ -636,111 +701,87 @@ int main() {
   addr.sin_family = AF_INET;
   addr.sin_port = ntohs(1234);
   addr.sin_addr.s_addr = ntohl(0); // 0.0.0.0
-  if (bind(fd, (const struct sockaddr *)&addr, sizeof(addr)) < 0) {
+  int rv = bind(fd, (const struct sockaddr *)&addr, sizeof(addr)) < 0;
+  if (rv) {
     die("bind()");
   }
 
   // set the listen fd to nonblocking mode
   fd_set_nb(fd);
 
+  rv = listen(fd, SOMAXCONN);
   // Listen
-  if (listen(fd, SOMAXCONN) < 0) {
-      die("listen()");
+  if (rv) {
+    die("listen()");
   }
-
-  // a map of all client connections, keyed by fd
-  Map *fd2conn = createMap();
   // the event loop
   Vector *poll_args = createVector(sizeof(struct pollfd));
-
+  g_data.fd2conn = createVector(sizeof(Conn*));
   while (true) {
     // prepare the arguments of the poll()
     clear(poll_args);
     // put the listening sockets in the first position
     struct pollfd pfd = {fd, POLLIN, 0};
-    insertElement(poll_args, &pfd);
+    insertElement(poll_args, &pfd, -1);
     // the rest are connection sockets
-    for (int i = 0; i < fd2conn->capacity; i++) {
-      Node *node = fd2conn->vector[i];
-      while (node != NULL) {
-        Conn *conn = (Conn*)node->value;
-        // always poll() for error
-        struct pollfd pfd = {conn->fd, POLLERR, 0};
-        // poll() flags from the application's intent
-        if (conn->want_read) {
-          pfd.events |= POLLIN;
-        }
-        if (conn->want_write) {
-          pfd.events |= POLLOUT;
-        }
-        insertElement(poll_args, &pfd);
-        node = node->next;
+    for (int i = 0; i < g_data.fd2conn->capacity; i++) {
+      Conn *conn = ((Conn**)g_data.fd2conn->data)[i];
+      if(!conn) {
+        continue;
       }
+      // always poll() for error
+      struct pollfd pfd = {conn->fd, POLLERR, 0};
+      // poll() flags from the application's intent
+      if (conn->want_read) {
+        pfd.events |= POLLIN;
+      }
+      if (conn->want_write) {
+        pfd.events |= POLLOUT;
+      }
+      insertElement(poll_args, &pfd, -1);
     }
     // wait for readiness
-    int rv = poll((struct pollfd*)poll_args->data, (nfds_t)poll_args->size, -1);
+    int32_t timeout_ms = next_timer_ms();
+    int rv = poll((struct pollfd*)poll_args->data, (nfds_t)poll_args->size, timeout_ms);
     if (rv < 0 && errno == EINTR) {
-      continue;
+      continue; // not an error
     }
     if (rv < 0) {
       die("poll");
     }
-
+    
     // handle the listening socket
     if (((struct pollfd*)poll_args->data)[0].revents) {
       Conn *conn = handle_accept(fd);
-      if (conn) {
-        int *key = (int*)malloc(sizeof(int));
-        if (!key) die("malloc failed");
-        *key = conn->fd;
-        put(fd2conn, key, conn, sizeof(int));
-      }
     }
-
     // handle connection sockets
-    for (size_t i = 1; i < poll_args->size; i++) { // note: skip the 1st
+    for (size_t i = 1; i < poll_args->size; i++) {
       uint32_t ready = ((struct pollfd*)poll_args->data)[i].revents;
       if (ready == 0) {
         continue;
       }
-      int conn_fd = ((struct pollfd*)poll_args->data)[i].fd;
-      Conn *conn = (Conn*)get(fd2conn, &conn_fd, sizeof(int));
+      Conn *conn = ((Conn**)g_data.fd2conn->data)[((struct pollfd*)poll_args->data)[i].fd];
+      // update the idle timer by moving conn to the end of the list
+      conn->last_active_ms = get_monotonic_msec();
+      dlist_detach(&conn->idle_node);
+      dlist_insert_before(&g_data.idle_list, &conn->idle_node);
+      // handle IO
       if (ready & POLLIN) {
-          assert(conn->want_read);
-          handle_read(conn); // application logic
+        assert(conn->want_read);
+        handle_read(conn); // application logic
       }
       if (ready & POLLOUT) {
-          assert(conn->want_write);
-          handle_write(conn); // application logic
+        assert(conn->want_write);
+        handle_write(conn); // application logic
       }
       // close the socket from socket error or application logic
       if ((ready & POLLERR) || conn->want_close) {
-        close(conn->fd);
-        int index = hash(&conn->fd, sizeof(int), fd2conn->capacity);
-        Node *node = fd2conn->vector[index];
-        Node *prev = NULL;
-        while (node != NULL) {
-          if (memcmp(node->key, &conn->fd, sizeof(int)) == 0) {
-            if (prev) {
-              prev->next = node->next;
-            } else {
-              fd2conn->vector[index] = node->next;
-            }
-            free(node->key);
-            freeVector(conn->incoming);
-            freeVector(conn->outgoing);
-            free(conn);
-            free(node);
-            fd2conn->size--;
-            break;
-          }
-          prev = node;
-          node = node->next;
-        }
+        conn_destroy(conn);
       }
-    } 
+    }
+    process_timers();
   }
-  freeMap(fd2conn);
+  freeVector(g_data.fd2conn);
   freeVector(poll_args);
   close(fd);
   return 0;

@@ -1,7 +1,7 @@
 #include "vector.h"
 
 Vector* createVector(size_t element_size) {
-  Vector* vector = (Vector*)malloc(sizeof(Vector));
+  Vector* vector = (Vector*)calloc(1, sizeof(Vector));
   vector->data = malloc(10 * element_size);
   vector->capacity = 10;
   vector->size = 0;
@@ -9,16 +9,20 @@ Vector* createVector(size_t element_size) {
   return vector;
 }
 
+
 void resizeVector(Vector* vector, size_t newCapacity) {
   vector->data = realloc(vector->data, newCapacity * vector->element_size);
   vector->capacity = newCapacity;
 }
 
-void insertElement(Vector* vector, void* element) {
+void insertElement(Vector* vector, void* element, int pos) {
   if (vector->size == vector->capacity) {
     resizeVector(vector, vector->capacity * 2);
   }
-  memcpy((char*)vector->data + vector->size * vector->element_size, element, vector->element_size);
+  if (pos < 0) {
+    pos = vector->size;
+  }
+  memcpy((char*)vector->data + pos * vector->element_size, element, vector->element_size);
   vector->size++;
 }
 
