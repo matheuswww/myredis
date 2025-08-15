@@ -6,4 +6,4 @@ This project is a simplified implementation of Redis, built from scratch in C. I
 - **Key-Value Storage**: Store and retrieve key-value pairs.
 - **Sets with Scores**: Supports sets with scoring.
 
-- this comes from a tutorial: https://build-your-own.org/redis
+this comes from a tutorial: https://build-your-own.org/redis
